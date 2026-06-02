@@ -12,6 +12,23 @@
 #             "clone" will only clone once.
 #   FORCE_SYNC: Whether to delete repositories on Forgejo that no longer exist on GitHub.
 #              Answer Yes (to delete) or No.
+#   OVERWRITES: How to reconcile per-file differences when a repo already exists on Forgejo
+#              (only applies to the "clone" strategy; mirrors are read-only via the API).
+#              YES => GitHub files overwrite the existing Forgejo files.
+#              NO  => differing GitHub files are added alongside as <name>_copy.<ext>.
+#              If unset and no .env is present you will be prompted; an empty answer defaults to NO.
+
+# Determine the current directory of the script. Location of .env file defaults to being co-located with the script. 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/.env"
+
+if [ -f "$ENV_FILE" ]; then
+    set -a
+    source "$ENV_FILE"
+    set +a
+else
+    echo "[Info] No .env file found at $ENV_FILE. Proceeding to manual setup. You will be prompted for environment variables..."
+fi
 
 # Define some color codes for output.
 red=$(tput setaf 1)
@@ -229,10 +246,24 @@ else
 	DRY_RUN=false
 fi
 
+# Get the OVERWRITES setting from the environment or via prompt.
+# Controls how differing files are reconciled during the clone-strategy file sync: YES => GitHub files overwrite the existing Forgejo files. NO  => differing GitHub files are added alongside as <name>_copy.<ext>. When no .env (or no OVERWRITES) is provided the user is prompted; an empty answer defaults to NO.
+OVERWRITES=$(or_default "$OVERWRITES" "${yellow}When a file differs, overwrite the Forgejo file with GitHub's version? (YES/NO):${reset}" "No")
+
+# Clean up OVERWRITES input.
+OVERWRITES="$(echo "$OVERWRITES" | tr -d '\n' | tr '[:upper:]' '[:lower:]')"
+
+if [[ "$OVERWRITES" =~ ^y(es)?$ ]]; then
+	OVERWRITES=true
+else
+	OVERWRITES=false
+fi
+
 echo -e "${green}Force sync is set to: ${FORCE_SYNC}${reset}"
 echo -e "${green}Migrate archive status is set to: ${MIGRATE_ARCHIVE_STATUS}${reset}"
 echo -e "${green}Migrate forks is set to: ${MIGRATE_FORKS}${reset}"
 echo -e "${green}Dry run is set to: ${DRY_RUN}${reset}"
+echo -e "${green}Overwrite differing files is set to: ${OVERWRITES}${reset}"
 
 if $DRY_RUN; then
 	echo -e "${cyan}=== DRY RUN MODE ===${reset}"
@@ -345,12 +376,277 @@ if $FORCE_SYNC; then
 fi
 
 # -------------------------
+# File-level sync helpers.
+#
+# After a clone-strategy migration, GitHub and Forgejo are compared file-by-file
+# (across every branch). Git blob SHAs are computed identically by GitHub and
+# Forgejo, so two files are "the same" exactly when their blob SHAs match.
+#   - A GitHub file with no Forgejo counterpart is created.
+#   - A GitHub file whose SHA differs from Forgejo's is either overwritten
+#     (OVERWRITES=true) or copied to <name>_copy.<ext> (OVERWRITES=false).
+# Files that exist only on Forgejo are left untouched (repo-level deletions are
+# handled separately by FORCE_SYNC).
+#
+# Mirror repos are intentionally skipped: Forgejo keeps them in sync on its own
+# and rejects writes through the content API.
+# -------------------------
+
+# URL-encode a file path, encoding each segment but preserving the slashes.
+urlencode_path() {
+	jq -rn --arg p "$1" '$p | split("/") | map(@uri) | join("/")'
+}
+
+# Compute the "_copy" variant of a path, inserting _copy before the extension.
+#   README.md      -> README_copy.md
+#   .gitignore     -> .gitignore_copy   (leading-dot files have no extension)
+copy_name() {
+	local path="$1" dir="" base ext
+	base="$path"
+	if [[ "$path" == */* ]]; then
+		dir="${path%/*}/"
+		base="${path##*/}"
+	fi
+	if [[ "$base" == *.* && "$base" != .* ]]; then
+		ext="${base##*.}"
+		base="${base%.*}_copy.${ext}"
+	else
+		base="${base}_copy"
+	fi
+	echo "${dir}${base}"
+}
+
+# Fetch all branches (name + commit sha) for a GitHub repo as a JSON array.
+github_branches() {
+	local owner="$1" repo="$2"
+	local page=1 all="[]" resp count
+	while true; do
+		resp=$(safe_curl "${curl_opts[@]}" "https://api.github.com/repos/$owner/$repo/branches?per_page=100&page=$page") || return 1
+		if echo "$resp" | jq -e 'type == "object" and has("message")' >/dev/null 2>&1; then
+			return 1
+		fi
+		count=$(echo "$resp" | jq 'if type == "array" then length else 0 end')
+		[ "$count" -eq 0 ] && break
+		all=$(echo "$all" "$resp" | jq -s 'add')
+		[ "$count" -lt 100 ] && break
+		page=$((page + 1))
+	done
+	echo "$all"
+}
+
+# Emit "sha<TAB>path" lines for every blob in a GitHub commit's tree.
+github_tree_blobs() {
+	local owner="$1" repo="$2" commit_sha="$3" resp
+	resp=$(safe_curl "${curl_opts[@]}" "https://api.github.com/repos/$owner/$repo/git/trees/$commit_sha?recursive=1") || return 1
+	if echo "$resp" | jq -e 'type == "object" and has("message")' >/dev/null 2>&1; then
+		return 1
+	fi
+	if [ "$(echo "$resp" | jq -r '.truncated')" = "true" ]; then
+		echo "      ${yellow}Warning: GitHub tree for $repo is truncated; some files may be skipped.${reset}" >&2
+	fi
+	echo "$resp" | jq -r '.tree[] | select(.type == "blob") | "\(.sha)\t\(.path)"'
+}
+
+# Fetch the head commit SHA of a Forgejo branch (empty if the branch is missing).
+forgejo_branch_sha() {
+	local owner="$1" repo="$2" branch="$3" resp
+	resp=$(safe_curl -H "Authorization: token $FORGEJO_TOKEN" "$FORGEJO_URL/api/v1/repos/$owner/$repo/branches/$(urlencode_path "$branch")") || return 1
+	echo "$resp" | jq -r '.commit.id // empty'
+}
+
+# Emit "sha<TAB>path" lines for every blob in a Forgejo commit's tree (paginated).
+forgejo_tree_blobs() {
+	local owner="$1" repo="$2" commit_sha="$3"
+	local page=1 resp total page_count collected=0
+	while true; do
+		resp=$(safe_curl -H "Authorization: token $FORGEJO_TOKEN" "$FORGEJO_URL/api/v1/repos/$owner/$repo/git/trees/$commit_sha?recursive=true&per_page=1000&page=$page") || return 1
+		total=$(echo "$resp" | jq -r '.total_count // 0')
+		page_count=$(echo "$resp" | jq -r '(.tree // []) | length')
+		[ "$page_count" -eq 0 ] && break
+		echo "$resp" | jq -r '.tree[] | select(.type == "blob") | "\(.sha)\t\(.path)"'
+		collected=$((collected + page_count))
+		[ "$collected" -ge "$total" ] && break
+		page=$((page + 1))
+	done
+}
+
+# Fetch a GitHub blob's content as single-line base64 (suitable for Forgejo's API).
+github_blob_content() {
+	local owner="$1" repo="$2" sha="$3" resp
+	resp=$(safe_curl "${curl_opts[@]}" "https://api.github.com/repos/$owner/$repo/git/blobs/$sha") || return 1
+	echo "$resp" | jq -r '.content' | tr -d '\n'
+}
+
+# Create a file on a Forgejo branch from GitHub blob content.
+# Args: gh_owner fj_owner repo branch filepath blob_sha kind [src_path]
+forgejo_create_file() {
+	local gh_owner="$1" fj_owner="$2" repo="$3" branch="$4" filepath="$5" blob_sha="$6" kind="$7" src_path="$8"
+	if [ "$kind" = "copy" ]; then
+		echo -ne "      ${cyan}Adding copy ${white}$filepath${cyan} (differs from ${src_path})...${reset}"
+	else
+		echo -ne "      ${green}Adding new file ${white}$filepath${green}...${reset}"
+	fi
+	if $DRY_RUN; then
+		echo -e " ${cyan}[DRY RUN]${reset}"
+		return 0
+	fi
+
+	local content
+	content=$(github_blob_content "$gh_owner" "$repo" "$blob_sha") || {
+		echo -e " ${red}Failed to fetch GitHub content.${reset}"
+		return 1
+	}
+	local payload
+	payload=$(jq -n --arg c "$content" --arg b "$branch" --arg m "Sync from GitHub: add $filepath" \
+		'{content: $c, branch: $b, message: $m}')
+	local resp
+	resp=$(safe_curl -X POST -H "Content-Type: application/json" -H "Authorization: token $FORGEJO_TOKEN" \
+		-d "$payload" "$FORGEJO_URL/api/v1/repos/$fj_owner/$repo/contents/$(urlencode_path "$filepath")") || {
+		echo -e " ${red}Request failed.${reset}"
+		return 1
+	}
+	local err
+	err=$(echo "$resp" | jq -r '.message // empty')
+	if [[ "$err" == *"already exists"* ]]; then
+		# A previous run already created this file; fall back to an update.
+		local existing
+		existing=$(forgejo_file_sha "$fj_owner" "$repo" "$branch" "$filepath")
+		if [ -n "$existing" ]; then
+			echo -ne " ${yellow}exists, updating...${reset}"
+			forgejo_update_file "$gh_owner" "$fj_owner" "$repo" "$branch" "$filepath" "$blob_sha" "$existing" "inline"
+			return $?
+		fi
+		echo -e " ${red}Error: $err${reset}"
+		return 1
+	elif [ -n "$err" ]; then
+		echo -e " ${red}Error: $err${reset}"
+		return 1
+	fi
+	echo -e " ${green}Done!${reset}"
+}
+
+# Look up the current blob SHA of a file on a Forgejo branch (empty if absent).
+forgejo_file_sha() {
+	local owner="$1" repo="$2" branch="$3" filepath="$4" resp
+	resp=$(safe_curl -H "Authorization: token $FORGEJO_TOKEN" \
+		"$FORGEJO_URL/api/v1/repos/$owner/$repo/contents/$(urlencode_path "$filepath")?ref=$(urlencode_path "$branch")") || return 1
+	echo "$resp" | jq -r '.sha // empty'
+}
+
+# Overwrite an existing Forgejo file with GitHub blob content.
+# Args: gh_owner fj_owner repo branch filepath blob_sha existing_sha [mode]
+# When mode is "inline" the leading status message is suppressed (caller printed it).
+forgejo_update_file() {
+	local gh_owner="$1" fj_owner="$2" repo="$3" branch="$4" filepath="$5" blob_sha="$6" existing_sha="$7" mode="$8"
+	if [ "$mode" != "inline" ]; then
+		echo -ne "      ${yellow}Overwriting ${white}$filepath${yellow}...${reset}"
+	fi
+	if $DRY_RUN; then
+		echo -e " ${cyan}[DRY RUN]${reset}"
+		return 0
+	fi
+
+	local content
+	content=$(github_blob_content "$gh_owner" "$repo" "$blob_sha") || {
+		echo -e " ${red}Failed to fetch GitHub content.${reset}"
+		return 1
+	}
+	local payload
+	payload=$(jq -n --arg c "$content" --arg b "$branch" --arg s "$existing_sha" --arg m "Sync from GitHub: update $filepath" \
+		'{content: $c, branch: $b, sha: $s, message: $m}')
+	local resp
+	resp=$(safe_curl -X PUT -H "Content-Type: application/json" -H "Authorization: token $FORGEJO_TOKEN" \
+		-d "$payload" "$FORGEJO_URL/api/v1/repos/$fj_owner/$repo/contents/$(urlencode_path "$filepath")") || {
+		echo -e " ${red}Request failed.${reset}"
+		return 1
+	}
+	local err
+	err=$(echo "$resp" | jq -r '.message // empty')
+	if [ -n "$err" ]; then
+		echo -e " ${red}Error: $err${reset}"
+		return 1
+	fi
+	echo -e " ${green}Done!${reset}"
+}
+
+# Compare a repo's GitHub and Forgejo trees across all branches and import
+# new/changed GitHub files into Forgejo according to OVERWRITES.
+sync_repo_files() {
+	local gh_owner="$1" fj_owner="$2" repo="$3"
+	local branches
+	branches=$(github_branches "$gh_owner" "$repo") || {
+		echo -e "    ${red}Could not list GitHub branches for $repo; skipping file sync.${reset}"
+		return 1
+	}
+
+	echo "$branches" | jq -c '.[]' | while read -r br; do
+		local branch gh_commit fj_commit
+		branch=$(echo "$br" | jq -r '.name')
+		gh_commit=$(echo "$br" | jq -r '.commit.sha')
+
+		fj_commit=$(forgejo_branch_sha "$fj_owner" "$repo" "$branch")
+		if [ -z "$fj_commit" ]; then
+			echo -e "    ${yellow}Branch ${white}$branch${yellow} not found on Forgejo; skipping.${reset}"
+			continue
+		fi
+
+		# Map of Forgejo path -> blob sha for this branch.
+		declare -A fj_map=()
+		while IFS=$'\t' read -r fsha fpath; do
+			[ -z "$fpath" ] && continue
+			fj_map["$fpath"]="$fsha"
+		done < <(forgejo_tree_blobs "$fj_owner" "$repo" "$fj_commit")
+
+		local changes=0
+		while IFS=$'\t' read -r gsha gpath; do
+			[ -z "$gpath" ] && continue
+			local existing="${fj_map[$gpath]:-}"
+			if [ "$existing" = "$gsha" ]; then
+				# Identical blob SHA: file already matches GitHub, nothing to do.
+				continue
+			elif [ -z "$existing" ]; then
+				# Present on GitHub, absent on Forgejo: import it.
+				forgejo_create_file "$gh_owner" "$fj_owner" "$repo" "$branch" "$gpath" "$gsha" "new"
+				changes=$((changes + 1))
+			elif [ "$OVERWRITES" = true ]; then
+				# Differs and overwriting is allowed: replace the Forgejo file.
+				forgejo_update_file "$gh_owner" "$fj_owner" "$repo" "$branch" "$gpath" "$gsha" "$existing"
+				changes=$((changes + 1))
+			else
+				# Differs and overwriting is disabled: keep both as <name>_copy.<ext>.
+				local copypath copy_existing
+				copypath="$(copy_name "$gpath")"
+				copy_existing="${fj_map[$copypath]:-}"
+				if [ "$copy_existing" = "$gsha" ]; then
+					# A copy from a previous run already matches GitHub; skip.
+					continue
+				elif [ -n "$copy_existing" ]; then
+					forgejo_update_file "$gh_owner" "$fj_owner" "$repo" "$branch" "$copypath" "$gsha" "$copy_existing"
+				else
+					forgejo_create_file "$gh_owner" "$fj_owner" "$repo" "$branch" "$copypath" "$gsha" "copy" "$gpath"
+				fi
+				changes=$((changes + 1))
+			fi
+		done < <(github_tree_blobs "$gh_owner" "$repo" "$gh_commit")
+
+		if [ "$changes" -eq 0 ]; then
+			echo -e "    ${green}Branch ${white}$branch${green} is already up to date.${reset}"
+		fi
+	done
+}
+
+# -------------------------
 # 3. Migrate each GitHub repository to Forgejo.
 # -------------------------
 repo_count=$(echo "$all_repos" | jq 'length')
 if [ "$repo_count" -eq 0 ]; then
 	echo "No repositories found for user $GITHUB_USER."
 	exit 0
+fi
+
+# The file-level sync only runs for the "clone" strategy. Mirrors are kept in
+# sync by Forgejo automatically and reject writes through the content API.
+if [ "$STRATEGY" = "mirror" ]; then
+	echo -e "${yellow}Note: per-file sync is skipped for the 'mirror' strategy (Forgejo keeps mirrors in sync and they are read-only via the API).${reset}"
 fi
 
 # Process each GitHub repo
@@ -451,5 +747,16 @@ echo "$all_repos" | jq -c '.[]' | while read -r repo; do
 				echo -e " ${cyan}[DRY RUN] Would archive: $repo_name${reset}"
 			fi
 		fi
+	fi
+
+	# File-level sync: import new/changed GitHub files into the Forgejo clone.
+	# Only meaningful for the "clone" strategy (mirrors are read-only on Forgejo).
+	if [ "$success" = true ] && [ "$STRATEGY" = "clone" ]; then
+		if [ "$OVERWRITES" = true ]; then
+			echo -e "  ${blue}Syncing files (OVERWRITES=YES: differing files will be overwritten)...${reset}"
+		else
+			echo -e "  ${blue}Syncing files (OVERWRITES=NO: differing files will be added as *_copy)...${reset}"
+		fi
+		sync_repo_files "$GITHUB_USER" "$FORGEJO_USER" "$repo_name"
 	fi
 done

@@ -10,3 +10,8 @@ export FORGEJO_TOKEN=""
 # Migration Strategy (mirror/clone)
 export STRATEGY="mirror"
 export FORCE_SYNC="No"
+
+# File-level sync (clone strategy only):
+#   Yes => GitHub files overwrite differing Forgejo files
+#   No  => differing GitHub files are added as <name>_copy.<ext>
+export OVERWRITES="No"

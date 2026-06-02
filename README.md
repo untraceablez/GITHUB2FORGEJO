@@ -25,6 +25,10 @@ that no longer exist on GitHub.
 - Supports both **public** and **private** repositories.
 - **Mirror mode**: repositories stay in sync with GitHub.
 - **Clone mode**: one-time copy without ongoing sync.
+- **File-level sync** (clone mode): on re-runs, compares every branch's files
+  against GitHub and imports new or changed files. `OVERWRITES=Yes` replaces the
+  Forgejo copy; `OVERWRITES=No` (default) keeps both by saving the GitHub version
+  as `<name>_copy.<ext>`. Skipped for mirrors, which Forgejo syncs automatically.
 - **Archive Transfer**: Optionally transfers the archived status so archived
   repos remain read-only on Forgejo.
 - **Skip Forks**: Option to ignore forked repositories during migration.
@@ -66,6 +70,7 @@ variables:
 | `MIGRATE_ARCHIVE_STATUS` | Set to `Yes` (default) to transfer the archived status of repositories          |
 | `MIGRATE_FORKS`          | Set to `No` to skip fork repositories during migration (default: `Yes`)         |
 | `DRY_RUN`                | Set to `Yes` to preview actions without executing (dry run mode, default: `No`) |
+| `OVERWRITES`             | When syncing files (clone strategy), `Yes` overwrites differing Forgejo files; `No` (default) adds them as `*_copy` |
 
 ### 2. Automated Development & Testing Environment
 
